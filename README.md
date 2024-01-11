@@ -2,7 +2,7 @@
 Source Code for ICASSP'24 paper: GCIA: A BLACK-BOX GRAPH INJECTION ATTACK METHOD VIA GRAPH CONTRASTIVE LEARNING
 1. Dataset:
 * Cora, Citeseer and PubMed datasets can be found in torch_geometric.datasets.Planetoid  
-* Reddit-12k dataset can be found in [G-NIA](https://github.com/TaoShuchang/G-NIA)
+* Reddit-12k dataset can be found in [G-NIA](https://github.com/TaoShuchang/G-NIA), put ''12k_reddit.npz'' and ''12k_reddit_split.npy'' to ''datasets/Reddit12k'':
 
 2. The required packages are as follows:
 * Python 3.8+
