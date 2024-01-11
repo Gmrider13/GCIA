@@ -1,5 +1,6 @@
 import copy
 import argparse
+import os
 
 import torch
 import os.path as osp
@@ -666,13 +667,14 @@ if __name__ == '__main__':
 
 
     GCL_model = Encoder(num_features=data.x.shape[1], hidden_dim=32, proj_dim=32,device=device)
-
-    if osp.exists(osp.join('saved_GCL_model', '{}.pth'.format(args.dataset))):
+    GCL_model_dir = osp.join('saved_GCL_model', '{}.pth'.format(args.dataset))
+    if osp.exists(GCL_model_dir):
         GCL_model.load_state_dict(torch.load(osp.join('saved_GCL_model', '{}.pth'.format(args.dataset))))
         GCL_model=GCL_model.to(device)
     else:
         GCL_model=GCL_model.to(device)
         GCL_model.fit_minibatch(data.cpu(),target_node_list,1000)
+        os.makedirs(GCL_model_dir)
         torch.save(GCL_model.state_dict(), osp.join('saved_GCL_model', '{}.pth'.format(args.dataset)))
 
 
