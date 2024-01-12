@@ -7,31 +7,19 @@ import os.path as osp
 import GCL.losses as L
 import GCL.augmentors as A
 import torch.nn.functional as F
-import torch_geometric.transforms as T
-from datasets.reddit_12k import Reddit12k
 from torch import nn
 from tqdm import tqdm
 from torch.optim import Adam
 from GCL.eval import get_split, LREvaluator
-from GCL.models import SingleBranchContrast
-from torch_geometric.nn import SAGEConv
-from torch_geometric.nn.inits import uniform
-from torch_geometric.loader import NeighborSampler
-from torch_geometric.datasets import Reddit, CoraFull
-from torch_geometric.datasets import Planetoid
-from torch_geometric.utils import k_hop_subgraph, subgraph
+from torch_geometric.utils import k_hop_subgraph
 from GCL.models import DualBranchContrast
 from torch_geometric.nn import GCNConv
-from torch_sparse import SparseTensor
 import numpy as np
 from target_model.gcn import GCN
 from target_model.GraphSAGE import SAGE
 from data_model_prepare import load_data, load_model
-# from target_model.GraphSAGE2 import SAGE
-'''
-接近正式版本
-使用MLP，并通过最大化与ori的内积，并最大化与失败样例的内积，实现攻击
-'''
+from torch_geometric.loader import NeighborLoader
+
 class GConv(torch.nn.Module):
     def __init__(self, input_dim, hidden_dim, activation, num_layers):
         super(GConv, self).__init__()
@@ -47,7 +35,7 @@ class GConv(torch.nn.Module):
             z = conv(z, edge_index, edge_weight)
             z = self.activation(z)
         return z
-from torch_geometric.loader import NeighborLoader
+
 class MLP(torch.nn.Module):
 
     def __init__(self,num_i,num_h,num_o):
@@ -55,7 +43,7 @@ class MLP(torch.nn.Module):
 
         self.linear1=torch.nn.Linear(num_i,num_h)
         self.relu=torch.nn.LeakyReLU()
-        self.linear2=torch.nn.Linear(num_h,num_h) #2个隐层
+        self.linear2=torch.nn.Linear(num_h,num_h)
         self.relu2=torch.nn.LeakyReLU()
         self.linear3=torch.nn.Linear(num_h,num_o)
         self.dropout=0.5
@@ -77,26 +65,6 @@ class MLP(torch.nn.Module):
         nn.init.xavier_uniform_(self.linear2.weight)
         nn.init.xavier_uniform_(self.linear3.weight)
 
-# class MLP(torch.nn.Module):
-#
-#     def __init__(self,num_i,num_h,num_o):
-#         super(MLP,self).__init__()
-#
-#         self.linear1=torch.nn.Linear(num_i,num_o)
-#         self.linear2=torch.nn.Linear(num_o+num_i,num_o) #2个隐层
-#
-#         self.initial()
-#
-#     def forward(self, x):
-#         x1 = self.linear1(x)
-#         x1 = F.log_softmax(x1)
-#         x2 = torch.cat((x,x1),dim=-1)
-#         x2 = self.linear2(x2)
-#         return x2
-#
-#     def initial(self):
-#         nn.init.xavier_uniform_(self.linear1.weight)
-#         nn.init.xavier_uniform_(self.linear2.weight)
 class Encoder(torch.nn.Module):
     def __init__(self,num_features, hidden_dim, proj_dim,device):
         super(Encoder, self).__init__()
@@ -183,7 +151,6 @@ class GCL_attacker(torch.nn.Module):
 
         self.encoder = encoder
 
-        # 这里使用的数据增强方法为随机节点注入
         self.discrete_feat = discrete_feat
 
         if discrete_feat:
@@ -197,7 +164,6 @@ class GCL_attacker(torch.nn.Module):
             self.feature_max,_ = ori_data.ori_x.max(dim=0)
             self.feature_min,_ = ori_data.ori_x.min(dim=0)
 
-        # self.augmentor = A.NodeInjection(self.feature_mean, self.feature_var)
         self.ori_data = ori_data
         self.device = device
         self.n_node = ori_data.x.shape[0]
@@ -205,45 +171,33 @@ class GCL_attacker(torch.nn.Module):
         self.n_class = data.y.max().item() + 1
         self.victim = victim
         self.MLP = MLP(num_i=32, num_h=64, num_o=self.n_class)
-        # self.feature_budget = (ori_data.x>0).float().sum(1).mean() if self.discrete_feat else ori_data.x.sum(1).mean()
-        # self.feature_budget = self.feature_budget/self.n_feat
 
     def get_pgd_attack(self,epoch):
 
         fake_feature = []
         total_e = []
         for target_node_index in tqdm(range(len(self.target_node_list))):
-            #获取最后一轮迭代的fake x
             target_node = self.target_node_list[target_node_index]
 
-
-            #对于离散变量，初始先添加30%的随机特征，以提供随机性
             if self.discrete_feat:
-                # fake_feature_n = self.feature_mean
                 fea_index = np.random.choice(self.n_feat, int(0.3*self.feature_mean),
                                              replace=False)
                 fake_x = torch.zeros([1, self.n_feat])
                 fake_x[0, fea_index] = 1
-                # fake_x = F.normalize(fake_x)
-                # fake_x = torch.zeros([1, self.n_feat])
+
             else:
                 fake_x = torch.normal(mean=self.feature_mean, std=0.1).reshape([1, -1])
                 fake_x=torch.clamp(fake_x,self.feature_min,self.feature_max)
 
             fake_x = fake_x.to(self.device)
             fake_x.requires_grad = True
-            # if self.discrete_feat:
-            #     fake_x_norm = F.normalize(fake_x)
-            # else:
-            #     fake_x_norm = fake_x
             fake_x_norm = F.normalize(fake_x)
-            #统计fake_x中的元素
+
             if self.discrete_feat:
                 one_index = fake_x.view(-1).nonzero().view(-1)
                 one_index = one_index.cpu().numpy()
                 zero_index = np.setdiff1d(np.arange(self.n_feat),one_index)
 
-            #获取目标节点的三阶子图
             modified_x_index, modified_edge, target_node_subgraph, _ = k_hop_subgraph(target_node,2,self.ori_data.edge_index,relabel_nodes=True)
             ori_modified_x = self.ori_data.x[modified_x_index]
             modified_x_ini = copy.deepcopy(ori_modified_x.detach())
@@ -251,32 +205,19 @@ class GCL_attacker(torch.nn.Module):
 
             h_ori = self.encoder.encoder(modified_x_ini, modified_edge.to(self.device), None)[target_node_subgraph,:].reshape([1,-1])
 
-
-            #节点注入
             modified_x = torch.cat([modified_x_ini,fake_x_norm],dim=0)
             fake_edge = torch.tensor([[target_node_subgraph,modified_x.shape[0]-1],[modified_x.shape[0]-1, target_node_subgraph]]).to(self.device)
             modified_edge = torch.cat([modified_edge, fake_edge],dim=1)
-            # modified_x.requires_grad=True
 
-            #迭代优化虚假节点的特征（位于modified_x的最后一个）
-
-            # best_loss = -1000
-            # best_fake = None
-            # patience = 50
             for grad_e in range(epoch):
 
                 h_adv = self.encoder.encoder(modified_x, modified_edge.to(self.device), None)[target_node_subgraph, :].reshape([1, -1])
-
                 diff_adv =F.normalize(self.encoder.project(h_ori)) @ F.normalize(self.encoder.project(h_adv)).T
-
                 MLP_pre = F.softmax(self.MLP(h_adv),dim=1)
                 MLP_loss = F.nll_loss(MLP_pre, self.ori_data.y[[target_node]])
-                # MLP_loss = self._CWloss(MLP_pre, self.ori_data.y[[target_node]])
 
                 loss = -diff_adv+MLP_loss
 
-
-                #这里使新生成的节点与之前的节点不一样。对于已经攻击完成的节点来说，是没有意义的
                 if len(self.fake_nodes[target_node])>=2:
                     self_diff = 0
                     for i in range(1,len(self.fake_nodes[target_node])):
@@ -288,22 +229,9 @@ class GCL_attacker(torch.nn.Module):
 
                 grad_all = torch.autograd.grad(loss, fake_x)[0]
                 adv_grad = grad_all.detach()[-1, :].reshape([1,-1])
-                # modified_x = modified_x.detach()
-                # grad = 0.1 * F.normalize(adv_grad)
                 lr = 200 / np.sqrt(grad_e+1)
                 grad = lr * adv_grad
-                # if loss.item() > best_loss:
-                #     best_loss = loss.item()
-                #     best_fake = modified_x[[-1], :].cpu().detach().numpy()
-                #     best_diff = diff_adv.item()
-                #     best_predict = MLP_pre
-                #     best_h_adv = h_adv.cpu().detach().numpy()
-                #     patience = 50
-                # else:
-                #     patience -= 1
-                #
-                # if grad_e > 100 and patience<= 0:
-                #     break
+
                 with torch.no_grad():
                     if self.discrete_feat:
                         zero_value = grad[:,zero_index]
@@ -321,21 +249,6 @@ class GCL_attacker(torch.nn.Module):
                             assert fake_x[-1][choosed_zero] == 0
                             assert fake_x[-1][choosed_one] == 1
 
-                            # modified_x[-1][choosed_zero] = 1
-                            # modified_x[-1][choosed_one] = 0
-                            # modified_x.requires_grad=True
-
-                            #这里原本对feature数量进行了限制，现在取消限制
-                            # if len(one_index)>=self.feature_max:
-                            #     one_index=np.delete(one_index,choosed_index1.item())
-                            #     zero_index=np.append(zero_index,choosed_one)
-                            # elif len(one_index)<=self.feature_min:
-                            #     zero_index=np.delete(zero_index,choosed_index0.item())
-                            #     one_index=np.append(one_index,choosed_zero)
-                            #
-                            # else:
-
-
                             if choosed_value0 > choosed_value1:
                                 zero_index=np.delete(zero_index,choosed_index0.item())
                                 one_index=np.append(one_index,choosed_zero)
@@ -343,58 +256,34 @@ class GCL_attacker(torch.nn.Module):
                                 one_index=np.delete(one_index,choosed_index1.item())
                                 zero_index=np.append(zero_index,choosed_one)
 
-
                         fake_x = torch.zeros([1, self.n_feat])
                         fake_x[0, one_index] = 1
                         if len(one_index) >= self.feature_mean:
                             break
-
                     else:
                         fake_x += grad[0,:]
-                        # fake_x.requires_grad = True
                         fake_x=torch.clamp(fake_x,self.feature_min,self.feature_max)
-                        # fake_x = 0.5*(self.feature_min+self.feature_max) + 0.5*(self.feature_max-self.feature_min)*torch.sin(fake_x)
-                        # modified_x[-1]=torch.clamp(modified_x[-1],self.feature_min,self.feature_max)
-                        # modified_x.requires_grad=True
-                # fake_x = fake_x.detach()
-                # fake_x = fake_x.to(self.device)
-                # fake_x.requires_grad=True
-                # if self.discrete_feat:
-                #     fake_x_norm = F.normalize(fake_x)
-                # else:
-                #     fake_x_norm = fake_x
+
                 fake_x = fake_x.to(self.device)
                 fake_x = fake_x.detach()
                 fake_x.requires_grad = True
                 fake_x_norm = F.normalize(fake_x)
 
                 modified_x = torch.cat([modified_x_ini,fake_x_norm],dim=0)
-                # modified_x.requires_grad = True
-            #将投影后的嵌入改为嵌入
-            # h_adv = self.encoder.project(
-            #     self.encoder.encoder(modified_x, modified_edge.to(self.device), None)
-            # )[0, :].reshape([1, -1])
 
-
-            # h_adv = self.encoder.encoder(modified_x, modified_edge.to(self.device), None)[0, :].reshape([1, -1])
-            #
-            # diff_adv = F.normalize(h_ori) @ F.normalize(h_adv).T
-            # pre_attack = self.victim(modified_x, modified_edge.to(self.device))
             self.fake_nodes[target_node].append({
                 "diff": diff_adv.item(),
                 "fake_x": fake_x.cpu().detach().numpy(),
-                # 'predict': MLP_pre,
-                'h_adv': h_adv.cpu().detach().numpy()
-            })
+                'h_adv': h_adv.cpu().detach().numpy()})
+
             if self.discrete_feat:
                 fake_feature.append(torch.sum(fake_x).item())
             else:
                 fake_feature.append(fake_x)
-        # return fake_nodes
+        #check if the fake node
         if self.discrete_feat:
             print(np.mean(fake_feature))
             print(self.feature_mean)
-            # print(total_e)
         else:
             fake_xs = torch.cat(fake_feature,dim=0)
             fake_max,_ = fake_xs.max(dim=0)
@@ -404,17 +293,9 @@ class GCL_attacker(torch.nn.Module):
     def attack_initial(self):
         fake_nodes = {}
 
-        #计算原始查询
         ori_pre = self.victim(self.ori_data.x, self.ori_data.edge_index)
         self.target_pre = {target_node:ori_pre[target_node][self.ori_data.y[target_node]].cpu().detach().numpy() for target_node in target_node_list}
         self.target_pre_all = {target_node:ori_pre[target_node].cpu().detach().numpy() for target_node in target_node_list}
-
-        #计算原始嵌入
-        # h_ori = self.encoder.project(
-        #     self.encoder.encoder(self.ori_data.x, self.ori_data.edge_index.to(self.device), self.ori_data.edge_attr)
-        # )
-        #将嵌入改为投影前
-        # h_ori = self.encoder.encoder(self.ori_data.x, self.ori_data.edge_index.to(self.device), self.ori_data.edge_attr)
 
         self.target_node_list = []
         for target_node in self.ori_target_node_list:
@@ -430,19 +311,16 @@ class GCL_attacker(torch.nn.Module):
 
             h_ori = self.encoder.encoder(ori_targey_x, target_edge.to(self.device), None)[target_node_subgraph,:].reshape([1,-1])
 
-            #生成初始随机扰动
             if self.discrete_feat:
                 fake_feature_n = self.feature_mean
                 fea_index = np.random.choice(self.n_feat, int(fake_feature_n),
                                              replace=False)
                 fake_x = torch.zeros([1, self.n_feat])
                 fake_x[0, fea_index] = 1
-                # fake_x = F.normalize(fake_x)
             else:
                 fake_x = torch.normal(mean=self.feature_mean, std=1).reshape([1,-1])
                 fake_x=torch.clamp(fake_x,self.feature_min,self.feature_max)
 
-            #记录
             fake_nodes[target_node]=[{
                 "fake_x": fake_x.cpu().numpy(),
                 "h_adv":h_ori.cpu().detach().numpy(),
@@ -454,7 +332,6 @@ class GCL_attacker(torch.nn.Module):
         fake_x_tensor = torch.from_numpy(fake_x).to(self.device).reshape([1,-1])
         modified_graph.x = torch.cat([modified_graph.x, fake_x_tensor], dim=0)
         modified_graph.x.requires_grad=True
-        # 这里添加的是无向边
         fake_edge = torch.tensor([[target_node, modified_graph.x.shape[0] - 1], [modified_graph.x.shape[0] - 1, target_node]]).to(self.device)
         modified_graph.edge_index = torch.cat([modified_graph.edge_index, fake_edge], dim=1)
         return modified_graph
@@ -470,11 +347,8 @@ class GCL_attacker(torch.nn.Module):
             self.fake_nodes[target_node][-1]['delt_r'] = self.target_pre[target_node] - target_pre.cpu().detach().numpy()[self.ori_data.y[target_node]]
 
             if torch.argmax(target_pre) == self.ori_data.y[target_node]:
-                # print("node {} success in epoch {}! {} ->{}, {}".format(target_node,e,self.ori_data.y[target_node],np.argmax(fake_nodes['reward']),fake_nodes['reward']))
-                # np.save("fake_node_for{}.npy".format(target_node),fake_nodes['fake_x'])
-                # self.target_node_list.remove(target_node)
                 query_acc.append(target_node)
-                # break
+
         self.target_node_list = query_acc
         print("GCL attack mr in epoch :",e,1-len(query_acc)/len(target_node_list))
 
@@ -518,7 +392,6 @@ class GCL_attacker(torch.nn.Module):
 
                 optimizer.zero_grad()
                 out = self.MLP(delt_z)
-                # loss = F.kl_div(out.log(), delt_r,reduction='batchmean')
                 out = F.log_softmax(out, dim=1)
                 loss = F.mse_loss(out[delt_mask], delt_r[delt_mask])
                 loss.backward()
@@ -544,10 +417,7 @@ class GCL_attacker(torch.nn.Module):
 
     def attack(self, target_node_list,k_hop):
         self.ori_target_node_list = copy.deepcopy(target_node_list)
-
         self.fake_nodes = self.attack_initial()
-        # self.get_pgd_attack(500)
-        # self.query(0)
 
         for e in range(10):
             self.train_MLP(1000)
@@ -566,6 +436,7 @@ class GCL_attacker(torch.nn.Module):
         k = -0.3
         loss = -torch.clamp(margin, min=k).mean()
         return loss
+
 def random_attack(data,target_node_list, victim,discrete_feat):
 
     atk_acc = []
@@ -582,19 +453,12 @@ def random_attack(data,target_node_list, victim,discrete_feat):
             ori_miss.append(target_node)
 
         for e in range(1):
-            # print(e)
-            # tmp_data = copy.deepcopy(self.ori_data)
-            # x_attack, edge_index_attack, edge_weight_attack = self.augmentor(tmp_data.x, tmp_data.edge_index,
-            #                                                                  tmp_data.edge_attr, [target_node])
             if discrete_feat:
-                # fake_feature_n = torch.normal(mean=feature_mean,std=feature_var)
-
                 fea_index = np.random.choice(data.x.shape[1], int(50),
                                              replace=False)
                 fake_x = torch.zeros([1, data.x.shape[1]])
                 fake_x[0, fea_index] = 1
                 fake_x = fake_x.to('cuda')
-                # fake_x = F.normalize(fake_x)
             else:
                 fake_x = torch.normal(mean=feature_mean, std=feature_std).reshape([1,-1]).to('cuda')
             modified_x = copy.deepcopy(data.x)
@@ -605,11 +469,8 @@ def random_attack(data,target_node_list, victim,discrete_feat):
 
             target_pre = victim(modified_x, modified_edge.to('cuda'))[target_node]
             if np.argmax(target_pre.cpu().detach().numpy()) != data.y[target_node]:
-                # print("node {} success in epoch {}! {} ->{}, {}".format(target_node,e,self.ori_data.y[target_node],np.argmax(target_pre.cpu().detach().numpy()),target_pre.cpu().detach().numpy()))
-                # print("node {} success in epoch {}".format(target_node, e))
                 atk_acc.append(target_node)
                 break
-    # print(all_node)
     print(len(target_node_list))
     print("ori miss:",len(ori_miss)/len(target_node_list))
     print("attack mr:",len(atk_acc)/len(target_node_list))
@@ -653,7 +514,6 @@ if __name__ == '__main__':
     data = data.to(device)
     feat_sum_before = torch.sum(data.x,dim=1)
     no_zero_before = data.x[0,:][data.x[0,:].nonzero()]
-    # data.x = F.normalize(data.x)
     feat_sum_after = torch.sum(data.x,dim=1)
     no_zero_after = data.x[0,:][data.x[0,:].nonzero()]
     test_nodes = torch.tensor([i for i in range(len(data.test_mask))]).to(device)[data.test_mask]
