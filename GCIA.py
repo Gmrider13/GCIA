@@ -397,6 +397,7 @@ class GCL_attacker(torch.nn.Module):
                 loss.backward()
                 optimizer.step()
                 added_loss = loss.item()
+                torch.cuda.empty_cache()
                 pbar.set_postfix({'loss': added_loss})
                 pbar.update()
                 if added_loss < min_loss:
@@ -412,7 +413,7 @@ class GCL_attacker(torch.nn.Module):
 
         print('=== early stopping at {0}, loss = {1} ==='.format(best_epoch, min_loss))
         self.MLP.load_state_dict(weights)
-
+        torch.cuda.empty_cache()
         self.MLP.eval()
 
     def attack(self, target_node_list,k_hop):
